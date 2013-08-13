@@ -37,8 +37,6 @@ struct refcount_class_t {
  * refcount_t - refs taken on an object
  */
 struct refcount_t {
-	/* XXX Does using a global refcount have impact on performance? */
-	atomic_t ref;
 	struct hlist_head table;
 };
 
@@ -49,9 +47,9 @@ static inline void refcount_warn (char *key)
 }
 
 /*
- * FIXME: handling functions assume that refcounted object is already
- *        locked when a reference is taken on it - no locking is implemented
- *        here! Very carefully check code paths when calling these.
+ * NOTE: we suppose that classes are created when the refcounted object is
+ *       allocated, that is at the beginning of its lifetime. Therefore,
+ *       locking is not needed even if going through the whole table.
  */
 
 /*
@@ -69,7 +67,6 @@ static inline void refcount_warn (char *key)
 static inline struct refcount_t *refcount_get (void)
 {
 	struct refcount_t *rc = kzalloc(sizeof(struct refcount_t), GFP_KERNEL);
-	atomic_set(&rc->ref, 0);
 	INIT_HLIST_HEAD(&rc->table);
 	return rc;
 }
@@ -111,7 +108,18 @@ static inline void refcount_destroy (struct refcount_t *rc)
 
 static inline int refcount_read (struct refcount_t *rc)
 {
-	return atomic_read(&rc->ref);
+	struct refcount_class_t *rcc;
+
+	/*
+	 * This is O(n) at its worst case. However, this would happen
+	 * only if the last class is the only one still having a positive
+	 * refcount.
+	 * FIXME: use hlist_for_each_entry_safe()?
+	 */
+	hlist_for_each_entry(rcc, &rc->table, class_node)
+		if (atomic_read(&rcc->ref) > 0)
+			return 1;
+	return 0;
 }
 
 static inline int refcount_class_read (struct refcount_class_t *rcc)
@@ -120,7 +128,7 @@ static inline int refcount_class_read (struct refcount_class_t *rcc)
 }
 
 /*
- * The *inc and *dec* functions take as a parameter a class, but their name
+ * The *inc* and *dec* functions take as a parameter a class, but their name
  * is generic because we assume the user wants to operate on a class but get
  * the global refcount of the object.
  */
@@ -128,14 +136,12 @@ static inline int refcount_class_read (struct refcount_class_t *rcc)
 static inline void refcount_inc (struct refcount_class_t *rcc)
 {
 	atomic_inc(&rcc->ref);
-	atomic_inc(&rcc->global->ref);
 }
 
 static inline void refcount_add (int source,
 				 struct refcount_class_t *dest)
 {
 	atomic_add(source, &dest->ref);
-	atomic_add(source, &dest->global->ref);
 }
 
 /*
@@ -149,20 +155,11 @@ static inline void refcount_dec (struct refcount_class_t *rcc)
 {
 	atomic_dec(&rcc->ref);
 	/*
-	 * If the refcount class is being decremented by mistake, just
-	 * exit without decreasing the global refcount, to avoid that the object
-	 * is freed from user logic while it still has users. This would most
-	 * likely lead to memory corruption.
-	 * Be sure to warn about the issue, though.
+	 * If the refcount class is being decremented by mistake, be sure to
+	 * warn about the issue.
 	 */
-	if (refcount_class_read(rcc) < 0) {
+	if (refcount_class_read(rcc) < 0)
 		refcount_warn(rcc->key);
-		goto out;
-	}
-	BUG_ON(refcount_read(rcc->global) <= 0);
-	atomic_dec(&rcc->global->ref);
-out:
-	return;
 }
 
 static inline bool refcount_dec_and_test (struct refcount_class_t *rcc)
