@@ -14,6 +14,7 @@
 #include <linux/rbtree.h>
 #include <linux/ioprio.h>
 #include <linux/blktrace_api.h>
+#include <linux/refcount.h>
 #include "blk.h"
 #include "blk-cgroup.h"
 
@@ -96,7 +97,9 @@ struct cfq_rb_root {
  */
 struct cfq_queue {
 	/* reference count */
-	int ref;
+	struct refcount_t *ref;
+	struct refcount_class_t *req_ref;
+	struct refcount_class_t *proc_ref;
 	/* various state flags, see below */
 	unsigned int flags;
 	/* parent cfq_data */
@@ -2829,7 +2832,7 @@ static int cfqq_process_refs(struct cfq_queue *cfqq)
 	int process_refs, io_refs;
 
 	io_refs = cfqq->allocated[READ] + cfqq->allocated[WRITE];
-	process_refs = cfqq->ref - io_refs;
+	process_refs = refcount_read(cfqq->ref) - io_refs;
 	BUG_ON(process_refs < 0);
 	return process_refs;
 }
@@ -2869,10 +2872,10 @@ static void cfq_setup_merge(struct cfq_queue *cfqq, struct cfq_queue *new_cfqq)
 	 */
 	if (new_process_refs >= process_refs) {
 		cfqq->new_cfqq = new_cfqq;
-		new_cfqq->ref += process_refs;
+		refcount_add(process_refs, new_cfqq->proc_ref);
 	} else {
 		new_cfqq->new_cfqq = cfqq;
-		cfqq->ref += new_process_refs;
+		refcount_add(new_process_refs, cfqq->proc_ref);
 	}
 }
 
@@ -3347,15 +3350,14 @@ static int cfq_dispatch_requests(struct request_queue *q, int force)
  * Each cfq queue took a reference on the parent group. Drop it now.
  * queue lock must be held here.
  */
-static void cfq_put_queue(struct cfq_queue *cfqq)
+static void cfq_put_queue(struct cfq_queue *cfqq, struct refcount_class_t *rcc)
 {
 	struct cfq_data *cfqd = cfqq->cfqd;
 	struct cfq_group *cfqg;
 
-	BUG_ON(cfqq->ref <= 0);
+	BUG_ON(refcount_read(cfqq->ref) <= 0);
 
-	cfqq->ref--;
-	if (cfqq->ref)
+	if (!refcount_dec_and_test(rcc))
 		return;
 
 	cfq_log_cfqq(cfqd, cfqq, "put_queue");
@@ -3369,6 +3371,7 @@ static void cfq_put_queue(struct cfq_queue *cfqq)
 	}
 
 	BUG_ON(cfq_cfqq_on_rr(cfqq));
+	refcount_destroy(cfqq->ref);
 	kmem_cache_free(cfq_pool, cfqq);
 	cfqg_put(cfqg);
 }
@@ -3389,7 +3392,7 @@ static void cfq_put_cooperator(struct cfq_queue *cfqq)
 			break;
 		}
 		next = __cfqq->new_cfqq;
-		cfq_put_queue(__cfqq);
+		cfq_put_queue(__cfqq, __cfqq->proc_ref);
 		__cfqq = next;
 	}
 }
@@ -3403,7 +3406,7 @@ static void cfq_exit_cfqq(struct cfq_data *cfqd, struct cfq_queue *cfqq)
 
 	cfq_put_cooperator(cfqq);
 
-	cfq_put_queue(cfqq);
+	cfq_put_queue(cfqq, cfqq->proc_ref);
 }
 
 static void cfq_init_icq(struct io_cq *icq)
@@ -3491,7 +3494,7 @@ static void check_ioprio_changed(struct cfq_io_cq *cic, struct bio *bio)
 					 GFP_ATOMIC);
 		if (new_cfqq) {
 			cic->cfqq[BLK_RW_ASYNC] = new_cfqq;
-			cfq_put_queue(cfqq);
+			cfq_put_queue(cfqq, cfqq->proc_ref);
 		}
 	}
 
@@ -3509,7 +3512,9 @@ static void cfq_init_cfqq(struct cfq_data *cfqd, struct cfq_queue *cfqq,
 	RB_CLEAR_NODE(&cfqq->p_node);
 	INIT_LIST_HEAD(&cfqq->fifo);
 
-	cfqq->ref = 0;
+	cfqq->ref = refcount_get();
+	cfqq->req_ref = refcount_class_get(cfqq->ref, "req");
+	cfqq->proc_ref = refcount_class_get(cfqq->ref, "proc");
 	cfqq->cfqd = cfqd;
 
 	cfq_mark_cfqq_prio_changed(cfqq);
@@ -3548,7 +3553,7 @@ static void check_blkcg_changed(struct cfq_io_cq *cic, struct bio *bio)
 		 */
 		cfq_log_cfqq(cfqd, sync_cfqq, "changed cgroup");
 		cic_set_cfqq(cic, NULL, 1);
-		cfq_put_queue(sync_cfqq);
+		cfq_put_queue(sync_cfqq, sync_cfqq->proc_ref);
 	}
 
 	cic->blkcg_id = id;
@@ -3653,11 +3658,11 @@ cfq_get_queue(struct cfq_data *cfqd, bool is_sync, struct cfq_io_cq *cic,
 	 * pin the queue now that it's allocated, scheduler exit will prune it
 	 */
 	if (!is_sync && !(*async_cfqq)) {
-		cfqq->ref++;
+		refcount_inc(cfqq->proc_ref);
 		*async_cfqq = cfqq;
 	}
 
-	cfqq->ref++;
+	refcount_inc(cfqq->proc_ref);
 	return cfqq;
 }
 
@@ -4142,7 +4147,8 @@ static void cfq_put_request(struct request *rq)
 		rq->elv.priv[0] = NULL;
 		rq->elv.priv[1] = NULL;
 
-		cfq_put_queue(cfqq);
+		cfq_put_queue(cfqq, cfqq->req_ref);
+		cfq_put_queue(cfqq, cfqq->req_ref);
 	}
 }
 
@@ -4153,7 +4159,7 @@ cfq_merge_cfqqs(struct cfq_data *cfqd, struct cfq_io_cq *cic,
 	cfq_log_cfqq(cfqd, cfqq, "merging with queue %p", cfqq->new_cfqq);
 	cic_set_cfqq(cic, cfqq->new_cfqq, 1);
 	cfq_mark_cfqq_coop(cfqq->new_cfqq);
-	cfq_put_queue(cfqq);
+	cfq_put_queue(cfqq, cfqq->proc_ref);
 	return cic_to_cfqq(cic, 1);
 }
 
@@ -4175,7 +4181,7 @@ split_cfqq(struct cfq_io_cq *cic, struct cfq_queue *cfqq)
 
 	cfq_put_cooperator(cfqq);
 
-	cfq_put_queue(cfqq);
+	cfq_put_queue(cfqq, cfqq->proc_ref);
 	return NULL;
 }
 /*
@@ -4225,7 +4231,7 @@ new_queue:
 
 	cfqq->allocated[rw]++;
 
-	cfqq->ref++;
+	refcount_inc(cfqq->req_ref);
 	cfqg_get(cfqq->cfqg);
 	rq->elv.priv[0] = cfqq;
 	rq->elv.priv[1] = cfqq->cfqg;
@@ -4312,13 +4318,13 @@ static void cfq_put_async_queues(struct cfq_data *cfqd)
 
 	for (i = 0; i < IOPRIO_BE_NR; i++) {
 		if (cfqd->async_cfqq[0][i])
-			cfq_put_queue(cfqd->async_cfqq[0][i]);
+			cfq_put_queue(cfqd->async_cfqq[0][i], cfqd->async_cfqq[0][i]->proc_ref);
 		if (cfqd->async_cfqq[1][i])
-			cfq_put_queue(cfqd->async_cfqq[1][i]);
+			cfq_put_queue(cfqd->async_cfqq[1][i], cfqd->async_cfqq[1][i]->proc_ref);
 	}
 
 	if (cfqd->async_idle_cfqq)
-		cfq_put_queue(cfqd->async_idle_cfqq);
+		cfq_put_queue(cfqd->async_idle_cfqq, cfqd->async_idle_cfqq->proc_ref);
 }
 
 static void cfq_exit_queue(struct elevator_queue *e)
@@ -4398,7 +4404,7 @@ static int cfq_init_queue(struct request_queue *q)
 	 * the reference from linking right away.
 	 */
 	cfq_init_cfqq(cfqd, &cfqd->oom_cfqq, 1, 0);
-	cfqd->oom_cfqq.ref++;
+	refcount_inc(cfqd->oom_cfqq.proc_ref);
 
 	spin_lock_irq(q->queue_lock);
 	cfq_link_cfqq_cfqg(&cfqd->oom_cfqq, cfqd->root_group);
